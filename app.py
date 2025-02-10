@@ -12,7 +12,7 @@ app = Flask(__name__)
 
 # Fetching OHLC data from Binance API
 def fetch_ohlc_data(symbol, months=6):
-    base_url = "https://api.binance.com/api/v3/klines"
+    base_url = "https://api.coingecko.com/api/v3/coins/{symbol}/market chart" 
     interval = "1d"
     limit = min(months * 30, 1000)
 
