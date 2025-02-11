@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from flask import Flask, render_template, jsonify, request
 from sklearn.preprocessing import MinMaxScaler
 import logging
@@ -14,36 +13,48 @@ app = Flask(__name__)
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 
-# Map Binance-style symbols to CoinGecko coin IDs
-def get_coingecko_id(symbol):
-    coingecko_mapping = {
-        "BTC": "bitcoin",
-        "ETH": "ethereum",
-        "BNB": "binancecoin",
-        "XRP": "ripple",
-        "ADA": "cardano",
-        "SOL": "solana",
-        "DOT": "polkadot",
-        "DOGE": "dogecoin",
-        "MATIC": "polygon",
-        "LTC": "litecoin",
-        "TRX": "tron",
-        "LINK": "chainlink",
-        "AVAX": "avalanche-2"
-    }
+# LSTM Model
+class LSTMModel(nn.Module):
+    def __init__(self):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size=1, hidden_size=50, num_layers=2, batch_first=True)
+        self.fc = nn.Linear(50, 1)
 
-    symbol = symbol.upper().replace("USDT", "").replace("USD", "")
-    return coingecko_mapping.get(symbol, None)
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        return self.fc(lstm_out[:, -1])
 
-# Fetch OHLC data from CoinGecko API (only last 30 days)
-def fetch_ohlc_data(symbol, days=30):
-    coingecko_id = get_coingecko_id(symbol)
-    
-    if not coingecko_id:
-        logging.error(f"Coin not found: {symbol}")
-        return None
+# Load the trained model
+def load_trained_model():
+    model = LSTMModel()
+    model.load_state_dict(torch.load("model.pth", map_location=torch.device("cpu")))
+    model.eval()
+    return model
 
-    url = f"https://api.coingecko.com/api/v3/coins/{coingecko_id}/market_chart"
+# Mapping common trading pairs to CoinGecko coin IDs
+SYMBOL_MAPPING = {
+    "BTCUSD": "bitcoin",
+    "ETHUSD": "ethereum",
+    "DOGEUSD": "dogecoin",
+    "XRPUSD": "ripple",
+    "ADAUSD": "cardano",
+    "SOLUSD": "solana",
+    "DOTUSD": "polkadot",
+    "LTCUSD": "litecoin",
+    "BCHUSD": "bitcoin-cash",
+    "BNBUSD": "binancecoin",
+    "AVAXUSD": "avalanche-2",
+    "MATICUSD": "matic-network",
+    "SHIBUSD": "shiba-inu",
+    "LINKUSD": "chainlink",
+    "UNIUSD": "uniswap",
+    "XLMUSD": "stellar"
+}
+
+# Fetch OHLC data from CoinGecko
+def fetch_ohlc_data(symbol, days=180):
+    symbol = SYMBOL_MAPPING.get(symbol.upper(), symbol.lower())  # Convert symbol to CoinGecko ID
+    url = f"https://api.coingecko.com/api/v3/coins/{symbol}/market_chart"
     params = {"vs_currency": "usd", "days": days, "interval": "daily"}
 
     try:
@@ -51,7 +62,7 @@ def fetch_ohlc_data(symbol, days=30):
         data = response.json()
 
         if "prices" not in data:
-            logging.error(f"Error fetching data: {data}")
+            logging.error(f"Error fetching data for {symbol}: {data}")
             return None
 
         df = pd.DataFrame(data["prices"], columns=["timestamp", "close"])
@@ -63,63 +74,33 @@ def fetch_ohlc_data(symbol, days=30):
         logging.error(f"Request failed: {e}")
         return None
 
-# Prepare data for model (lookback reduced to 10)
+# Prepare data for prediction
 def prepare_data(df):
     scaler = MinMaxScaler(feature_range=(0, 1))
     df_scaled = scaler.fit_transform(df[['close']])
 
-    X, y = [], []
-    lookback = 10  # Reduced from 20
+    X, _ = [], []
+    lookback = 20
+
     for i in range(len(df_scaled) - lookback):
         X.append(df_scaled[i:i + lookback])
-        y.append(df_scaled[i + lookback])
 
-    X, y = np.array(X), np.array(y)
+    return torch.tensor(X, dtype=torch.float32), scaler
 
-    return torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.float32), scaler
-
-# Optimized LSTM model (smaller to fit Render's memory)
-class LSTMModel(nn.Module):
-    def __init__(self):
-        super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size=1, hidden_size=20, num_layers=1, batch_first=True)  # Reduced size
-        self.fc = nn.Linear(20, 1)
-
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        return self.fc(lstm_out[:, -1])
-
-# Train model with only 5 epochs
-def train_model(model, X, y, epochs=5, batch_size=8, lr=0.001):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
-    batch_size = min(batch_size, X.shape[0])
-
-    for epoch in range(epochs):
-        model.train()
-        optimizer.zero_grad()
-        y_pred = model(X)
-        loss = loss_fn(y_pred, y)
-        loss.backward()
-        optimizer.step()
-
-        if (epoch + 1) % 2 == 0:
-            logging.info(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item():.6f}")
-
-# Predict future prices (only 30 days)
+# Predict next 30 days
 def predict_future(model, X, scaler):
     model.eval()
     future_inputs = X[-1].unsqueeze(0)
     predicted_prices = []
 
-    for _ in range(30):  # Predicting only 30 days
+    for _ in range(30):  # Predicting 30 days
         pred = model(future_inputs).item()
         predicted_prices.append(pred)
         future_inputs = torch.cat((future_inputs[:, 1:, :], torch.tensor([[[pred]]], dtype=torch.float32)), dim=1)
 
     return scaler.inverse_transform(np.array(predicted_prices).reshape(-1, 1)).flatten()
 
-# Flask routes
+# Flask Routes
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -127,22 +108,27 @@ def index():
 @app.route('/fetch_prices', methods=['GET'])
 def fetch_prices():
     symbol = request.args.get('symbol')
+    if not symbol:
+        return jsonify({'error': 'Symbol parameter is required'}), 400
+
     df = fetch_ohlc_data(symbol)
     if df is not None:
         times = df.index.strftime('%Y-%m-%d').tolist()
         prices = df['close'].tolist()
         return jsonify({'times': times, 'prices': prices})
     else:
-        return jsonify({'error': 'Failed to fetch data'}), 400
+        return jsonify({'error': f'Failed to fetch data for symbol: {symbol}'}), 400
 
 @app.route('/predict_prices', methods=['GET'])
 def predict_prices():
     symbol = request.args.get('symbol')
+    if not symbol:
+        return jsonify({'error': 'Symbol parameter is required'}), 400
+
     df = fetch_ohlc_data(symbol)
     if df is not None:
-        X, y, scaler = prepare_data(df)
-        model = LSTMModel()
-        train_model(model, X, y)  # Train with only 5 epochs
+        X, scaler = prepare_data(df)
+        model = load_trained_model()
         predicted_prices = predict_future(model, X, scaler)
 
         future_dates = pd.date_range(df.index[-1] + pd.Timedelta(days=1), periods=30, freq='D')
@@ -153,7 +139,7 @@ def predict_prices():
 
         return jsonify({'times': times, 'predicted_prices': predicted_prices})
     else:
-        return jsonify({'error': 'Failed to fetch data for prediction'}), 400
+        return jsonify({'error': f'Failed to fetch data for prediction of {symbol}'}), 400
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=True)     
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)), debug=True)
