@@ -24,7 +24,7 @@ class LSTMModel(nn.Module):
         lstm_out, _ = self.lstm(x)
         return self.fc(lstm_out[:, -1])
 
-# Load the trained model
+# Load the trained model with no_grad to save memory
 def load_trained_model():
     model = LSTMModel()
     model.load_state_dict(torch.load("model.pth", map_location=torch.device("cpu")))
@@ -51,8 +51,8 @@ SYMBOL_MAPPING = {
     "XLMUSD": "stellar"
 }
 
-# Fetch OHLC data from CoinGecko
-def fetch_ohlc_data(symbol, days=180):
+# Fetch OHLC data from CoinGecko (Last 60 days)
+def fetch_ohlc_data(symbol, days=60):
     symbol = SYMBOL_MAPPING.get(symbol.upper(), symbol.lower())  # Convert symbol to CoinGecko ID
     url = f"https://api.coingecko.com/api/v3/coins/{symbol}/market_chart"
     params = {"vs_currency": "usd", "days": days, "interval": "daily"}
@@ -74,27 +74,28 @@ def fetch_ohlc_data(symbol, days=180):
         logging.error(f"Request failed: {e}")
         return None
 
-# Prepare data for prediction
+# Prepare data for prediction (Using 60 days of past data)
 def prepare_data(df):
     scaler = MinMaxScaler(feature_range=(0, 1))
     df_scaled = scaler.fit_transform(df[['close']])
 
     X, _ = [], []
-    lookback = 20
+    lookback = 20  # Using 20 days for training
 
     for i in range(len(df_scaled) - lookback):
         X.append(df_scaled[i:i + lookback])
 
     return torch.tensor(X, dtype=torch.float32), scaler
 
-# Predict next 30 days
+# Predict next 30 days (Optimized for memory)
 def predict_future(model, X, scaler):
     model.eval()
-    future_inputs = X[-1].unsqueeze(0)
+    future_inputs = X[-1].unsqueeze(0)  # Start from last available data
     predicted_prices = []
 
-    for _ in range(30):  # Predicting 30 days
-        pred = model(future_inputs).item()
+    for _ in range(30):  # Predict for 30 days
+        with torch.no_grad():  # Prevents unnecessary memory usage
+            pred = model(future_inputs).item()
         predicted_prices.append(pred)
         future_inputs = torch.cat((future_inputs[:, 1:, :], torch.tensor([[[pred]]], dtype=torch.float32)), dim=1)
 
